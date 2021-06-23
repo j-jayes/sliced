@@ -306,7 +306,7 @@ rf_pred <- bind_cols(rf_pred, test %>% select(id)) %>%
     rename(profit = .pred) %>% 
     relocate(profit, .after = id)
 
-write.csv(rf_pred, "submission_1.csv")
+write.csv(rf_pred, "submission_1.csv", row.names = F)
 
 ```
 

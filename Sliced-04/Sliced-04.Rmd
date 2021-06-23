@@ -65,15 +65,21 @@ We can use the themis package to smote upsample the days of rain tomorrow.
 What other information do we have?
 
 ```{r}
-train %>% 
+train %>% skimr::skim()
+```
 
+
+```{r}
 train %>% 
     count(location, sort = T) %>% 
     tail()
 
 train %>% count(rainfall, sort = T)
 
-train %>% ggplot(aes(rainfall, fill = )) + geom_density()
+train %>% 
+    ggplot(aes(rainfall, fill = rain_tomorrow)) + 
+    geom_density()
+
 ```
 
 Lots of rain today correlated with rainfall tomorrow. Makes sense.
@@ -94,13 +100,166 @@ train %>% ggplot(aes(rainfall, rain_tomorrow)) +
 
 ```
 
+What's the deal with wind? Surely location specific?
+
 ```{r}
 train %>% 
     count(wind_gust_dir, sort = T)
 
 train %>% 
-    count(wind_gust_dir, rain_tomorrow, sort = T)
+    count(wind_gust_dir, rain_tomorrow, sort = T) %>% 
+    ggplot(aes(n, wind_gust_dir, fill = factor(rain_tomorrow))) +
+    geom_col(position = "dodge") 
 
+train %>% 
+    count(wind_gust_speed, rain_tomorrow, sort = T) %>% 
+    ggplot(aes(wind_gust_speed, n, colour = factor(rain_tomorrow))) +
+    geom_point() 
+
+```
+
+What's the deal with temperature?
+
+```{r}
+train %>% 
+    ggplot(aes(min_temp, rain_tomorrow)) +
+    geom_point() +
+    geom_smooth()
+
+train %>% 
+    ggplot(aes(max_temp, rain_tomorrow)) +
+    geom_point() +
+    geom_smooth()
+```
+
+That's super surprising! Min temp is increasing in probability of rain, but max temp is decreasing!
+
+```{r}
+train %>% 
+    ggplot(aes(max_temp, rain_tomorrow)) +
+    geom_point() +
+    geom_smooth() +
+    facet_wrap(~ rain_today)
+
+```
+
+We can see that if there is a low temperature today and a low max_temp today and rain today, there is a super high likelihood of rain tomorrow.
+
+What's the deal with seasonality?
+
+```{r}
+train %>% 
+    select(date)
+
+train %>% 
+    mutate(week = week(date)) %>% 
+    ggplot(aes(week, rain_tomorrow)) +
+    geom_point() +
+    geom_smooth()
+
+train %>% 
+    filter(!is.na(rain_today)) %>% 
+    mutate(week = week(date)) %>% 
+    ggplot(aes(week, rain_tomorrow)) +
+    geom_point() +
+    geom_smooth() +
+    facet_wrap( ~ rain_today)
+
+```
+
+There is winter rain, with higher likelihood of rain tomorrow if there is rain today.
+
+What do we do with evaporation and sunshine? I'm not really sure
+
+```{r}
+train %>% 
+    count(sunshine, rain_tomorrow)
+
+train %>% 
+    count(evaporation, rain_tomorrow)
+    
+```
+
+
+### Make a model
+
+```{r}
+library(themis)
+
+rf_rec <- recipe(rain_tomorrow ~ ., data = train) %>% 
+    update_role(id, "id") %>% 
+    step_mutate(rain_tomorrow = factor(case_when(
+        
+        rain_tomorrow > 0 ~ "rain",
+        TRUE ~ "no rain"
+        
+    ))) %>% 
+    step_date(date, features = c("month", "week")) %>%
+    step_rm(date, evaporation, sunshine) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_impute_knn(all_nominal_predictors()) %>% 
+    step_other(location, wind_gust_dir, wind_gust_speed) %>%
+    step_normalize(all_numeric_predictors()) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_smote(rain_tomorrow)
+
+rf_rec %>% prep() %>% juice()
+    
+```
+
+### Random forest model
+
+```{r}
+# recipe
+ranger_rec <- rf_rec %>% 
+    step_mutate(rain_tomorrow = as.numeric(rain_tomorrow))
+
+# model specification
+ranger_spec <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger") 
+
+# model workflow
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_rec) %>% 
+  add_model(ranger_spec)
+
+# hyper parameters
+params <- parameters(ranger_spec) %>% 
+    update(mtry = finalize(mtry(), x = train %>% select(-rain_tomorrow)))
+
+# grid
+ranger_grid <- grid_regular(params, levels = 5)
+
+```
+
+```{r}
+set.seed(79912)
+ranger_tune <- tune_grid(ranger_workflow, 
+                resamples = train_fold,
+                control = control_grid(save_pred = TRUE),
+                grid = ranger_grid)
+
+ranger_tune %>% collect_metrics()
+
+ranger_tune %>% select_best()
+
+ranger_best <- ranger_tune %>% select_best()
+
+ranger_pred <- ranger_tune %>% 
+  collect_predictions(parameters = ranger_best) %>% 
+  mutate(model = "Ranger")
+
+ranger_pred %>% 
+    ggplot(aes(.pred, profit)) +
+    geom_point() +
+    geom_abline()
+
+library(vip)
+# testing
+ranger_tune %>% pull_workflow_fit() %>% vip()
 
 ```
 
