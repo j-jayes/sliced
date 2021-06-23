@@ -1,0 +1,312 @@
+---
+title: "Sliced_03"
+author: "JJayes"
+date: "22/06/2021"
+output: html_document
+---
+
+## Purpose
+
+Competing along in the sliced data science game show.
+
+Prediction problems are released each week - this week the data is about Super Store sales. Contestants will use metadata about Super Store sales to predict profit. Each row is a product and volume of sales for a single product in a given store.
+
+### Prep
+
+```{r}
+library(tidyverse)
+library(scales)
+library(tidymodels)
+```
+
+
+### Reading in data
+
+```{r}
+df <- read.csv("train.csv")
+
+df <- df %>% 
+    as_tibble()
+
+```
+
+### EDA
+
+```{r}
+skimr::skim(df)
+```
+
+We are predicting profit from ship_mode:discount.
+
+Profit looks to be in dollar terms - we might want to divide it by sales or quantity?
+
+```{r}
+df %>% 
+    select(profit, sales, quantity)
+
+# df %>% head() %>% view()
+```
+
+
+### Counting things
+
+```{r}
+df %>% 
+    count(ship_mode, sort = T)
+
+df %>% 
+    count(segment, sort = T)
+
+df %>% count(country)
+```
+ Can drop country
+ 
+```{r}
+df %>% 
+    count(city, sort = T)
+
+df %>% 
+    count(state, sort = T) %>% tail()
+```
+
+can maybe do some lumping in state
+
+```{r}
+df %>% count(category)
+
+df %>% count(sub_category)
+```
+
+Is there overlap between category and subcategory?
+
+```{r}
+df %>% count(category, sub_category)
+```
+
+No
+
+### Simple plots
+
+Sales vs profit?
+
+```{r}
+df %>% 
+    ggplot(aes(profit, sales)) +
+    geom_point()
+```
+
+Sales by category?
+
+```{r}
+df %>% 
+    ggplot(aes(sales, fill = category)) +
+    geom_density() +
+    facet_wrap(~ category) +
+    scale_x_continuous(limits = c(0,3000))
+```
+
+Office supplies are generally worth less than furniture and technologoy 
+
+Profit by region?
+
+```{r}
+df %>% 
+    ggplot(aes(profit, sales, colour = region)) +
+    geom_point() +
+    facet_wrap(~ region)
+```
+
+Profit by subcategory?
+
+```{r}
+
+df %>% 
+    ggplot(aes(profit, fill = sub_category)) +
+    geom_density() +
+    facet_wrap(~ sub_category) +
+    scale_x_log10() +
+    geom_vline(xintercept = 1, lty = 2)
+
+```
+
+Profit by discount
+
+```{r}
+df %>% 
+    ggplot(aes(profit, discount)) +
+    geom_jitter()
+
+df %>% 
+    mutate(pct_profit = profit/sales) %>% 
+    ggplot(aes(pct_profit, discount)) +
+    geom_jitter() +
+    geom_vline(xintercept = 0, lty = 2) 
+
+```
+
+Profit by discount by category
+
+```{r}
+df %>%
+    mutate(pct_profit = profit/sales) %>% 
+    mutate(sub_category = fct_lump(sub_category, 8)) %>% 
+    ggplot(aes(pct_profit, discount, colour = sub_category)) +
+    geom_jitter() +
+    geom_vline(xintercept = 0, lty = 2) 
+
+```
+
+Interesting - there appears to be a relationship between discount and subcategory
+
+```{r}
+df %>% 
+    count(sub_category, discount) %>% 
+    ggplot(aes(as.factor(discount), n, fill = sub_category)) +
+    geom_col(position = "fill")
+
+```
+
+It might be work making discount a factor
+
+### Model prep
+
+```{r}
+df_sales <- df %>% 
+    select(-country, - postal_code)
+
+sales_folds <- vfold_cv(df_sales, v = 5)
+```
+
+### Making a model
+
+```{r}
+sales_rec <- recipe(profit ~ ., data = df_sales) %>% 
+    # new role
+    update_role(id, new_role = "id") %>% 
+    # novel for new things in testing data
+    step_novel(all_nominal_predictors()) %>%
+    # making other for uncommon classes
+    step_other(city, state, threshold = 0.01) %>% 
+    # normalize
+    step_normalize(all_numeric_predictors())
+
+sales_rec %>% prep() %>% bake(new_data = NULL)
+```
+
+Choosing some models to use
+
+```{r}
+library(usemodels)
+
+usemodels::use_ranger(profit ~ ., data = df_sales)
+
+```
+
+### Ranger model
+
+```{r}
+# recipe
+ranger_rec <- sales_rec
+
+# model specification
+ranger_spec <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger") 
+
+# model workflow
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_rec) %>% 
+  add_model(ranger_spec)
+
+# hyper parameters
+params <- parameters(ranger_spec) %>% 
+    update(mtry = finalize(mtry(), x = df_sales %>% select(-profit)))
+
+# grid
+ranger_grid <- grid_regular(params, levels = 5)
+```
+
+Tuning ranger model
+
+```{r}
+library(parallel)
+library(doParallel)
+parallel::detectCores()
+n.cores <- parallel::detectCores() - 2
+
+my.cluster <- parallel::makeCluster(
+  n.cores, 
+  type = "PSOCK"
+  )
+doParallel::registerDoParallel(cl = my.cluster)
+```
+
+
+```{r}
+set.seed(79912)
+ranger_tune <- tune_grid(ranger_workflow, 
+                resamples = sales_folds,
+                control = control_grid(save_pred = TRUE),
+                grid = ranger_grid)
+
+ranger_tune %>% collect_metrics()
+
+ranger_tune %>% select_best()
+
+ranger_best <- ranger_tune %>% select_best()
+
+ranger_pred <- ranger_tune %>% 
+  collect_predictions(parameters = ranger_best) %>% 
+  mutate(model = "Ranger")
+
+ranger_pred %>% 
+    ggplot(aes(.pred, profit)) +
+    geom_point() +
+    geom_abline()
+
+library(vip)
+# testing
+ranger_tune %>% pull_workflow_fit() %>% vip()
+
+```
+
+Ranger submission
+
+```{r}
+# the last model
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 2, trees = 1000) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+# the last workflow
+last_rf_workflow <- 
+  ranger_workflow %>% 
+  update_model(last_rf_mod)
+
+rf_fit <- fit(last_rf_workflow, df_sales)
+```
+
+variable importance from ranger model
+
+```{r}
+rf_fit %>% pull_workflow_fit() %>% vip()
+```
+
+Fitting on test data
+
+```{r}
+test <- read.csv("test.csv") %>% as_tibble()
+
+rf_pred <- predict(rf_fit, test) 
+
+rf_pred <- bind_cols(rf_pred, test %>% select(id)) %>% 
+    rename(profit = .pred) %>% 
+    relocate(profit, .after = id)
+
+write.csv(rf_pred, "submission_1.csv")
+
+```
+

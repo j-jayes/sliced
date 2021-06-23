@@ -1,0 +1,106 @@
+---
+title: "Sliced-04"
+author: "JJayes"
+date: "23/06/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Core tidyverse
+library(tidyverse)
+library(scales)
+library(lubridate)
+theme_set(theme_light())
+
+# Tidy Models
+library(tidymodels)
+library(textrecipes)
+library(stacks)
+doParallel::registerDoParallel(cores = 4)
+
+```
+
+Set up the datasets.
+
+```{r}
+# RMSE for linear (or roc_auc, etc, but better to pick one)
+mset <- metric_set(rmse)
+# Set up to inspect model outputs, or to stack model candidates
+grid_control <- control_grid(save_pred = TRUE,
+                             save_workflow = TRUE,
+                             extract = extract_model)
+```
+
+```{r}
+folder <- "~/Recon/sliced/Sliced-04/"
+dataset <- read_csv(paste0(folder, "train.csv"))
+holdout <- read_csv(paste0(folder, "test.csv"))
+sample <- read_csv(paste0(folder, "sample_submission.csv"))
+# What are we predicting?
+colnames(sample)
+set.seed(2021)
+spl <- initial_split(dataset, .prop = .75)
+train <- training(spl)
+test <- testing(spl)
+train_fold <- train %>%
+  vfold_cv(5)
+```
+
+### EDA
+
+What is the outcome we want to predict?
+
+```{r}
+train %>% count(rain_tomorrow, sort = T)
+```
+
+Whether it will rain tomorrow. We have a class imbalance. Roughly 22 percent of the sample has rain tomorrow.
+
+We can use the themis package to smote upsample the days of rain tomorrow.
+
+What other information do we have?
+
+```{r}
+train %>% 
+
+train %>% 
+    count(location, sort = T) %>% 
+    tail()
+
+train %>% count(rainfall, sort = T)
+
+train %>% ggplot(aes(rainfall, fill = )) + geom_density()
+```
+
+Lots of rain today correlated with rainfall tomorrow. Makes sense.
+
+```{r}
+train %>% 
+    count(rain_today, rain_tomorrow, sort = T)
+
+train %>% 
+    filter(!is.na(rain_today)) %>% 
+    count(rain_today, rain_tomorrow, sort = T) %>% 
+    ggplot(aes(rain_today, rain_tomorrow, fill = n)) +
+    geom_tile()
+
+train %>% ggplot(aes(rainfall, rain_tomorrow)) +
+    geom_point() +
+    geom_smooth()
+
+```
+
+```{r}
+train %>% 
+    count(wind_gust_dir, sort = T)
+
+train %>% 
+    count(wind_gust_dir, rain_tomorrow, sort = T)
+
+
+```
+
