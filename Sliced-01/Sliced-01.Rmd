@@ -1,0 +1,372 @@
+---
+title: "Sliced-practice-01"
+author: "JJayes"
+date: "24/06/2021"
+output: html_document
+---
+
+## Purpose
+
+```{r}
+
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Core tidyverse
+library(tidyverse)
+library(scales)
+library(lubridate)
+theme_set(theme_light())
+# Tidy Models
+library(tidymodels)
+library(textrecipes)
+library(stacks)
+doParallel::registerDoParallel(cores = 4)
+```
+
+Set up the datasets.
+
+```{r}
+# RMSE for linear (or roc_auc, etc, but better to pick one)
+mset <- metric_set(rmse)
+# Set up to inspect model outputs, or to stack model candidates
+grid_control <- control_grid(save_pred = TRUE,
+                             save_workflow = TRUE,
+                             extract = extract_model)
+```
+
+```{r}
+folder <- "~/Recon/sliced/Sliced-01/"
+dataset <- read_csv(paste0(folder, "train.csv")) %>%
+  # this will allow us to collapse all of the categories down to on that is comma separated, that we can tokenize and then filter.
+  unite(category, starts_with("category"), sep = ", ", na.rm = T)
+
+holdout <- read_csv(paste0(folder, "test.csv")) %>% 
+  unite(category, starts_with("category"), sep = ", ", na.rm = T)
+
+sample <- read_csv(paste0(folder, "sample_submission.csv"))
+# What are we predicting?
+colnames(sample)
+set.seed(2021)
+spl <- initial_split(dataset, .prop = .75)
+train <- training(spl)
+test <- testing(spl)
+train_fold <- train %>%
+  vfold_cv(5)
+```
+
+## EDA
+
+What are we predicting?
+
+```{r}
+train %>% 
+    ggplot(aes(geek_rating)) +
+    geom_histogram()
+```
+
+```{r}
+train %>% skimr::skim()
+```
+
+
+### What are the categorical variables?
+
+```{r}
+train %>% 
+    count(mechanic, sort = T)
+
+train %>% 
+  separate_rows(mechanic, sep = ", ") %>% 
+  count(mechanic, sort = T)
+```
+
+Will need to split mechanic by comma
+
+```{r}
+train %>% 
+    count(designer, sort = T)
+
+train %>% 
+    mutate(designer = fct_lump(designer, 10)) %>% 
+    ggplot(aes(geek_rating, fill = designer)) +
+    geom_histogram() +
+    scale_fill_brewer(palette = "Paired") +
+    facet_wrap(~ designer, scales = "free_y")
+
+```
+
+Categories?
+
+```{r}
+
+train %>% 
+  separate_rows(category, sep = ", ") %>% 
+  count(category, sort = T)
+
+```
+
+### What are the numeric variables?
+
+Should perhaps log the num votes
+
+```{r}
+train %>% 
+    ggplot(aes(num_votes, geek_rating)) +
+    geom_point() +
+    scale_x_log10(labels = number) +
+    geom_smooth()
+
+```
+
+What about the `owned` variable?
+
+```{r}
+train %>% 
+    ggplot(aes(owned, geek_rating)) +
+    geom_point() +
+    scale_x_log10(labels = number) +
+    geom_smooth()
+
+```
+
+```{r}
+train %>% 
+    ggplot(aes(owned, num_votes)) +
+    geom_point(alpha = .3) +
+    scale_x_log10(label = number) +
+    scale_y_log10(label = number) +
+    geom_smooth() +
+    geom_abline()
+    
+```
+
+
+Data quality in year
+
+```{r}
+train %>% 
+    ggplot(aes(year, geek_rating)) +
+    geom_smooth() +
+    geom_point() +
+    coord_cartesian(xlim = c(1950, 2020))
+```
+
+```{r}
+train %>% 
+    ggplot(aes(max_players, geek_rating)) +
+    geom_point() +
+    coord_cartesian(xlim = c(0,10))
+
+train %>% 
+    ggplot(aes(max_players, geek_rating, group = max_players)) +
+    geom_boxplot() +
+    coord_cartesian(xlim = c(0,12))
+
+```
+
+### Metric set
+
+```{r}
+mset <- metric_set(rmse, rsq)
+
+```
+
+
+### Recipe
+
+```{r}
+rec <- recipe(geek_rating ~ ., data = train) %>% 
+    update_role(game_id, new_role = "id") %>% 
+    step_log(num_votes, owned, offset = 1) %>% 
+    step_mutate(year = case_when(
+        year < 1950 ~ mean(year),
+        TRUE ~ year)) %>% 
+    step_mutate(max_players = pmin(max_players, 30)) %>% 
+    step_tokenize(mechanic, designer, category, token = "regex", options = list(pattern = ", ")) %>% 
+    step_tokenfilter(designer, max_tokens = tune()) %>% 
+    step_tf(mechanic, designer, category) %>% 
+    step_other(all_nominal_predictors(), threshold = tune()) %>% 
+    step_ns(year, deg_free = tune()) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_normalize(all_numeric_predictors()) %>% 
+    step_nzv(all_predictors())
+
+
+rec %>% prep() %>% juice()
+
+# paste0(colnames(train), sep = " + ")
+# 
+# lm(geek_rating ~ min_players + max_players + , data = train)
+
+
+```
+
+### Specification
+
+```{r}
+elastic_spec <- linear_reg(penalty = tune(), mixture = tune()) %>% 
+    set_mode("regression") %>% 
+    set_engine("glmnet")
+
+```
+
+
+### Workflows
+
+```{r}
+elastic_rec <- rec
+
+elastic_wf <- workflow() %>% 
+    add_recipe(elastic_rec) %>% 
+    add_model(elastic_spec)
+
+```
+
+### Grid
+
+```{r}
+
+elastic_grid <- grid_regular(parameters(elastic_wf),
+                             levels = 5)
+
+# elastic_grid <- crossing(max_tokens = c(40, 50, 100),
+#                          penalty = 10 ^ seq(-7, -2, .1),
+#                          mixture = c(.5, .9, .99, 1))
+
+```
+
+40 is the right number of tokens
+
+### Tune grid
+
+Tuning hyper-parameters
+
+```{r}
+elastic_tune <- tune_grid(
+    
+    elastic_wf,
+    grid = elastic_grid,
+    resamples = train_fold
+    
+)
+
+elastic_tune %>% autoplot()
+
+elastic_tune %>% select_best(metric = "rsq")
+
+```
+
+Looking for what is important based on the new parameters?
+
+```{r}
+elastic_wf_final <- finalize_workflow(elastic_wf, elastic_tune %>% select_best(metric = "rsq"))
+
+elastic_fit <- elastic_wf_final %>% 
+    fit(train)
+
+elastic_fit %>% 
+    pull_workflow_fit() %>% 
+    tidy() %>% 
+    filter(term != "(Intercept)") %>% 
+    mutate(term = fct_reorder(term, estimate)) %>% 
+    ggplot(aes(estimate, term)) +
+    geom_point() +
+  geom_vline(xintercept = 0, lty = 2)
+
+elastic_final_fit <- elastic_wf_final %>% 
+  last_fit(spl)
+
+elastic_final_fit %>% 
+  collect_metrics()
+    
+```
+
+
+## Random forest
+
+Recipe
+
+```{r}
+rf_rec <- recipe(geek_rating ~ ., data = train) %>% 
+    update_role(game_id, new_role = "id") %>% 
+    step_log(num_votes, owned, offset = 1) %>% 
+    step_mutate(year = case_when(
+        year < 1950 ~ mean(year),
+        TRUE ~ year)) %>% 
+    step_mutate(max_players = pmin(max_players, 30)) %>% 
+    step_tokenize(mechanic, designer, category, token = "regex", options = list(pattern = ", ")) %>% 
+    step_tokenfilter(designer, mechanic, category, max_tokens = 50) %>% 
+    step_tf(mechanic, designer, category) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_nzv(all_predictors())
+
+
+```
+
+Model
+
+```{r}
+rf_spec <- rand_forest("regression",
+            mtry = tune(),
+            trees = tune()) %>% 
+  set_engine("ranger") %>% 
+  # to measure importance
+  set_args(importance = "impurity")
+```
+
+Workflow
+
+```{r}
+rf_workflow <- workflow() %>% 
+  add_recipe(rf_rec) %>% 
+  add_model(rf_spec)
+
+```
+
+Grid
+
+```{r}
+rf_grid <- crossing(trees = c(100, 1000),
+                    mtry = seq(10, 20, 2))
+```
+
+Tune grid
+
+```{r}
+rf_tune <- tune_grid(rf_workflow,
+                    grid = rf_grid,
+                    resamples = train_fold)
+
+rf_tune %>% 
+  autoplot()
+
+rf_tune %>% select_best(metric = "rsq")
+
+```
+
+```{r}
+rf_wf_final <- finalize_workflow(rf_workflow, rf_tune %>% select_best(metric = "rsq"))
+
+rf_fit <- rf_wf_final %>% 
+    fit(train)
+
+rf_fit %>% 
+    pull_workflow_fit()
+
+
+rf_final_fit <- rf_wf_final %>% 
+  last_fit(spl)
+
+rf_final_fit %>% 
+  collect_metrics()
+```
+
+## XGBoost
+

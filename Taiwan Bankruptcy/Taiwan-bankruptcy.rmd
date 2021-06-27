@@ -1,0 +1,174 @@
+---
+title: "Taiwan Bankruptcy"
+author: "JJayes"
+date: "27/06/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Core tidyverse
+library(tidyverse)
+library(scales)
+library(lubridate)
+theme_set(theme_light())
+# Tidy Models
+library(tidymodels)
+library(textrecipes)
+library(stacks)
+# doParallel::registerDoParallel(cores = 4)
+```
+
+Set up the datasets.
+
+```{r}
+# RMSE for linear (or roc_auc, etc, but better to pick one)
+mset <- metric_set(rmse)
+# Set up to inspect model outputs, or to stack model candidates
+grid_control <- control_grid(save_pred = TRUE,
+                             save_workflow = TRUE,
+                             extract = extract_model)
+```
+
+### Reading in data
+
+```{r}
+folder <- "~/Recon/sliced/Taiwan Bankruptcy"
+# dataset <- read_csv(paste0(folder, "train.csv"))
+# holdout <- read_csv(paste0(folder, "test.csv"))
+# sample <- read_csv(paste0(folder, "sample_submission.csv"))
+df <- read_csv("data/data.csv")
+
+df <- df %>% 
+    janitor::clean_names()
+
+dataset <- df
+
+# What are we predicting?
+colnames(dataset)
+set.seed(2021)
+spl <- initial_split(dataset, .prop = .75, strata = bankrupt)
+train <- training(spl)
+test <- testing(spl)
+train_fold <- train %>%
+  vfold_cv(5)
+```
+
+### EDA
+
+```{r}
+train %>% 
+    count(bankrupt)
+```
+
+We have a massive class imbalance.
+
+```{r}
+train %>% 
+    skimr::skim()
+
+train %>% 
+    ggplot(aes(roa_c_before_interest_and_depreciation_before_interest, fill = factor(bankrupt))) +
+    geom_density() +
+    facet_wrap(~ bankrupt, nrow = 2)
+
+```
+
+Function to draw density plots by bankrupt
+
+Come bank to this
+
+```{r}
+dens_plot <- function(var){
+    
+    train %>% 
+        ggplot(aes(var, fill = factor(bankrupt))) +
+        geom_density() +
+        facet_wrap(~ bankrupt, nrow = 2)
+        
+}
+
+train %>% 
+    dens_plot(roa_a_before_interest_and_percent_after_tax)
+
+```
+
+### Recipe
+
+```{r}
+library(themis)
+
+rec <- recipe(bankrupt ~ ., data = train) %>% 
+    step_mutate(bankrupt = factor(bankrupt)) %>% 
+    step_nzv(all_numeric_predictors()) %>% 
+    step_normalize(all_numeric_predictors()) %>% 
+    step_smote(bankrupt)
+
+rec
+
+rec %>% prep() %>% juice()
+
+```
+
+Lasso model
+
+```{r}
+
+lasso_rec <- rec
+
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>% 
+    set_mode("classification") %>% 
+    set_engine("glmnet")
+
+lasso_grid <- grid_regular(parameters(lasso_spec))
+
+lasso_wf <- workflow() %>% 
+    add_recipe(lasso_rec) %>% 
+    add_model(lasso_spec)
+
+lasso_tune <- tune_grid(
+    lasso_wf,
+    grid = lasso_grid,
+    control = grid_control,
+    resamples = train_fold
+)
+
+lasso_tune %>% select_best()
+
+lasso_tune %>% 
+  autoplot()
+```
+
+```{r}
+
+lasso_wf_final <- finalize_workflow(lasso_wf, lasso_tune %>% select_best())
+
+lasso_fit <- lasso_wf_final %>% 
+    fit(train)
+
+lasso_fit %>% 
+    pull_workflow_fit() %>% 
+    tidy() %>% 
+    filter(term != "(Intercept)") %>% 
+    mutate(term = fct_reorder(term, estimate)) %>% 
+    ggplot(aes(estimate, term)) +
+    geom_point() +
+  geom_vline(xintercept = 0, lty = 2)
+
+lasso_final_fit <- lasso_wf_final %>% 
+  last_fit(spl)
+
+lasso_final_fit %>% 
+  collect_metrics()
+
+lasso_final_fit %>% 
+  unnest(.predictions) %>% 
+  conf_mat(bankrupt, .pred_class) %>% 
+  autoplot()
+
+```
+
