@@ -21,6 +21,13 @@ library(tidymodels)
 library(textrecipes)
 library(stacks)
 # doParallel::registerDoParallel(cores = 4)
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {library(tidymodels)})
 ```
 
 Set up the datasets.
@@ -83,17 +90,16 @@ Function to draw density plots by bankrupt
 Come bank to this
 
 ```{r}
-dens_plot <- function(var){
+dens_plot <- function(tbl, var){
     
-    train %>% 
+    tbl %>% 
         ggplot(aes(var, fill = factor(bankrupt))) +
         geom_density() +
         facet_wrap(~ bankrupt, nrow = 2)
         
 }
 
-train %>% 
-    dens_plot(roa_a_before_interest_and_percent_after_tax)
+dens_plot(train, roa_a_before_interest_and_percent_after_tax)
 
 ```
 
@@ -144,7 +150,6 @@ lasso_tune %>%
 ```
 
 ```{r}
-
 lasso_wf_final <- finalize_workflow(lasso_wf, lasso_tune %>% select_best())
 
 lasso_fit <- lasso_wf_final %>% 
@@ -161,7 +166,10 @@ lasso_fit %>%
 
 lasso_final_fit <- lasso_wf_final %>% 
   last_fit(spl)
+```
 
+
+```{r}
 lasso_final_fit %>% 
   collect_metrics()
 

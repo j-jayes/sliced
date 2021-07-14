@@ -1,0 +1,293 @@
+---
+title: "Sliced-07"
+author: "JJayes"
+date: "14/07/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(scales)
+
+theme_set(theme_light())
+```
+
+### Purpose
+
+Doing sliced 07 predicting churn
+
+### Reading in data
+
+```{r}
+education_levels <- c("Unknown", "Uneducated", "High School", "College", "Graduate", "Post-Graduate", "Doctorate")
+
+income_categories <- c("Unknown", "Less than $40K", "$40K - $60K", "$60K - $80K", "$80K - $120K", "$120K +")
+
+df <- read.csv("train.csv") %>% as_tibble() %>% rename(churned = attrition_flag) %>% 
+  mutate(churned = if_else(churned == 1, "yes", "no"),
+         education_level = fct_relevel(education_level, education_levels),
+         income_category = fct_relevel(income_category, income_categories))
+
+test_data <- read.csv("test.csv") %>% as_tibble() %>% 
+  mutate(education_level = fct_relevel(education_level, education_levels),
+         income_category = fct_relevel(income_category, income_categories))
+
+ss <- read.csv("sample_submission.csv")
+
+```
+
+### What are we predicting?
+
+```{r}
+colnames(ss)
+```
+
+Attrition flag
+
+### Spend the data budget
+
+```{r}
+spl <- initial_split(df, strata = churned)
+
+train <- training(spl)
+test <- testing(spl)
+folds <- vfold_cv(train, v = 5)
+```
+
+### Modelling prep
+Creating a metric set - we are being evaluated on logloss
+
+```{r}
+mset <- metric_set(mn_log_loss, accuracy, specificity)
+
+grid_control <- control_grid(save_pred = TRUE,
+                             save_workflow = TRUE,
+                             extract = extract_model)
+
+```
+
+### parallel backend
+
+```{r}
+library(doParallel)
+
+cl <- makePSOCKcluster(8)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {library(tidymodels)})
+```
+
+
+## EDA
+
+```{r}
+train %>% count(churned)
+```
+
+Highly unbalanced data set. Maybe use an auto encoder??
+
+```{r}
+train %>% skimr::skim()
+
+train %>% count(education_level)
+train %>% count(income_category)
+
+train %>% count(total_relationship_count)
+```
+
+
+```{r}
+library(ggridges)
+library(wesanderson)
+
+train %>% 
+    select(-id, -gender, -education_level, -income_category) %>% 
+    gather(variable, value, -churned) %>% 
+    ggplot(aes(y = factor(variable),
+               fill = factor(churned),
+               x = percent_rank(value))) +
+    geom_density_ridges(alpha = .7) +
+    scale_fill_manual(values = wes_palette("Darjeeling1")) +
+  labs(x = "Percentile of predictor",
+       y = NULL,
+       fill = "Churned")
+
+```
+
+### Summarize churn
+
+```{r}
+summarise_churn <- function(tbl){
+  
+  tbl %>% 
+    summarise(n = n(),
+              n_churned = sum(churned == "yes"),
+              pct_churned = n_churned / n,
+              low = qbeta(.025, n_churned + .5, n - n_churned + .5),
+              high = qbeta(.975, n_churned + .5, n - n_churned + .5)) %>% 
+    arrange(desc(n))
+  
+}
+
+train %>% group_by(gender) %>% summarise_churn()
+```
+
+
+```{r}
+train %>% 
+  group_by(gender) %>% 
+  summarise_churn() %>% 
+  ggplot(aes(pct_churned, gender, fill = gender)) +
+  geom_col(show.legend = F) +
+  geom_errorbarh(aes(xmin = low, xmax = high), height = .5) +
+  scale_x_continuous(labels = percent) +
+  labs(x = "Percent churned",
+       y = "Gender") +
+  scale_fill_manual(values = wes_palette("Darjeeling2"))
+
+train %>% 
+  group_by(education_level) %>% 
+  summarise_churn() %>% 
+  ggplot(aes(pct_churned, education_level, fill = education_level)) +
+  geom_col(show.legend = F) +
+  geom_errorbarh(aes(xmin = low, xmax = high), height = .5) +
+  scale_x_continuous(labels = percent) +
+  labs(x = "Percent churned",
+       y = "Gender") +
+  scale_fill_brewer(palette = "Paired")
+
+```
+
+
+
+### Penalized linear regression
+
+```{r}
+library(themis)
+
+glmnet_recipe <- 
+  recipe(formula = churned ~ ., data = train) %>% 
+    step_mutate(churned = factor(churned)) %>% 
+  step_factor2string(gender, education_level, income_category) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+    step_smote(churned)
+
+glmnet_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_mode("classification") %>% 
+  set_engine("glmnet") 
+
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(glmnet_recipe) %>% 
+  add_model(glmnet_spec) 
+
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20)) 
+
+glmnet_tune <- 
+  tune_grid(glmnet_workflow, 
+            metrics = mset,
+            resamples = folds,
+            grid = glmnet_grid)
+```
+
+What does it look like?
+
+```{r}
+glmnet_tune %>% autoplot()
+```
+
+### xgboost model
+
+```{r}
+usemodels::use_xgboost(formula = churned ~ ., data = train)
+```
+
+We want to do an xgboost model and add in the ones that are numeric, and make the categorical ones ordinal.
+
+```{r}
+library(themis)
+
+xgboost_recipe <- 
+  recipe(formula = churned ~ ., data = train) %>% 
+  update_role(id, new_role = "id") %>% 
+  step_mutate(income_category = as.integer(income_category)) %>% 
+  step_mutate(education_level = as.integer(education_level)) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_smote(churned)
+
+xgboost_recipe %>% prep() %>% juice()
+
+xgboost_spec <- 
+  boost_tree(trees = tune(), mtry = tune(), learn_rate = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost") 
+
+xgboost_workflow <- 
+  workflow() %>% 
+  add_recipe(xgboost_recipe) %>% 
+  add_model(xgboost_spec) 
+
+xgboost_grid <- crossing(trees = seq(500, 1100, 50),
+         mtry = c(4, 6, 8, 10),
+         learn_rate = c(.01, .02))
+
+set.seed(2021)
+xgboost_tune <-
+  tune_grid(xgboost_workflow, 
+            resamples = folds, 
+            metrics = mset,
+            control = grid_control,
+            grid = xgboost_grid)
+```
+
+What does it look like?
+
+```{r}
+xgboost_tune %>% autoplot()
+
+xgboost_tune %>% collect_metrics() %>% 
+  filter(.metric == "mn_log_loss") %>% arrange(mean)
+```
+
+With step smote mean log loss is 0.0950
+Without step smote mean log loss is 0.0897
+
+
+Making a variable importance plot
+
+```{r}
+library(vip)
+
+xg_fit <- xgboost_workflow %>% 
+  finalize_workflow(select_best(xgboost_tune, metric = "mn_log_loss")) %>% 
+  fit(train)
+
+fit <- xg_fit %>% pull_workflow_fit()
+
+
+xg_fit %>% 
+  augment(test), type.predict = "prob") %>% 
+  mn_log_loss(.pred)
+```
+
+
+# Following on from david robinson
+
+QQ: How to deal with ordinal categories? Just make them numeric?
+
+Want to make a function called summarize attrition that gives mean attrition for each slice of data.
+
+```{r}
+
+```
+
