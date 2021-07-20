@@ -218,7 +218,8 @@ xgboost_recipe <-
   recipe(formula = churned ~ ., data = train) %>% 
   update_role(id, new_role = "id") %>% 
   step_mutate(income_category = as.integer(income_category)) %>% 
-  step_mutate(education_level = as.integer(education_level)) %>% 
+  step_mutate(education_level = as.integer(education_level)) %>%
+  step_mutate(avg_transaction = total_trans_amt / total_trans_ct) %>% 
   step_novel(all_nominal_predictors()) %>% 
   step_dummy(all_nominal_predictors()) %>% 
   step_nzv(all_predictors()) %>% 
@@ -228,7 +229,7 @@ xgboost_recipe <-
 xgboost_recipe %>% prep() %>% juice()
 
 xgboost_spec <- 
-  boost_tree(trees = tune(), mtry = tune(), learn_rate = tune()) %>% 
+  boost_tree(trees = tune(), mtry = tune(), learn_rate = tune(), tree_depth = tune()) %>% 
   set_mode("classification") %>% 
   set_engine("xgboost") 
 
@@ -237,9 +238,10 @@ xgboost_workflow <-
   add_recipe(xgboost_recipe) %>% 
   add_model(xgboost_spec) 
 
-xgboost_grid <- crossing(trees = seq(500, 1100, 50),
-         mtry = c(4, 6, 8, 10),
-         learn_rate = c(.01, .02))
+xgboost_grid <- crossing(trees = seq(500, 1250, 50),
+         mtry = c(7, 8, 10),
+         learn_rate = .02,
+         tree_depth = c(4, 5, 6, 7))
 
 set.seed(2021)
 xgboost_tune <-
@@ -262,8 +264,11 @@ xgboost_tune %>% collect_metrics() %>%
 With step smote mean log loss is 0.0950
 Without step smote mean log loss is 0.0897
 
+Adding in avg_transaction = avg_transaction_amt / avg_transaction_ct gets to 0.0891
 
 Making a variable importance plot
+
+Tuning tree depth makes things better.
 
 ```{r}
 library(vip)
@@ -272,12 +277,13 @@ xg_fit <- xgboost_workflow %>%
   finalize_workflow(select_best(xgboost_tune, metric = "mn_log_loss")) %>% 
   fit(train)
 
-fit <- xg_fit %>% pull_workflow_fit()
+model_fit <- xgboost::xgb.importance(model = extract_model(xg_fit))
 
+model_fit %>% as_tibble() %>% 
+  mutate(Feature = fct_reorder(Feature, Gain)) %>% 
+  ggplot(aes(Gain, Feature)) +
+  geom_col()
 
-xg_fit %>% 
-  augment(test), type.predict = "prob") %>% 
-  mn_log_loss(.pred)
 ```
 
 
@@ -285,9 +291,44 @@ xg_fit %>%
 
 QQ: How to deal with ordinal categories? Just make them numeric?
 
+He turns them into factors in the right order and then says as.numeric(factor).
+
 Want to make a function called summarize attrition that gives mean attrition for each slice of data.
 
+Can improve labels here
 ```{r}
+train %>% 
+  ggplot(aes(total_trans_ct, total_trans_amt / total_trans_ct, colour = churned)) +
+  geom_point(alpha = .5) +
+  geom_smooth(method = "loess") +
+  scale_x_log10() +
+  scale_y_log10()
 
 ```
+
+What about relationships?
+
+```{r}
+train %>% 
+  group_by(total_relationship_count) %>% 
+  summarise_churn() %>% 
+  ggplot(aes(total_relationship_count, pct_churned)) +
+  geom_point() +
+  geom_line() +
+  geom_ribbon(aes(ymax = high, ymin = low), alpha = .5, fill = "lightblue") +
+  expand_limits(y = 0) +
+  labs(x = "Total relationship count",
+       y = "% churned")
+
+```
+
+## What to do next.
+
+More tuning on learn rate
+
+```{r}
+train
+
+```
+
 

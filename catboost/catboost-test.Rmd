@@ -1,0 +1,342 @@
+---
+title: "catboost-test"
+author: "JJayes"
+date: "17/07/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+```
+
+## Purpose
+
+I want to try out the catboost algorithm to see how good it is at prediction compared to xgboost
+
+### Data
+
+New York AirBnB prices - trying to predict price
+
+```{r}
+df <- read.csv("AB_NYC_2019.csv")
+
+df <- df %>% 
+    as_tibble() %>% 
+    janitor::clean_names()
+
+```
+
+### EDA
+
+```{r}
+df %>% 
+    ggplot(aes(price)) +
+    geom_histogram() +
+    scale_x_log10()
+
+df %>% 
+    count(neighbourhood_group)
+
+library(ggridges)
+library(wesanderson)
+
+df %>% 
+    mutate(neighbourhood_group = fct_reorder(neighbourhood_group, log(price +1 ), .fun = median)) %>% 
+    ggplot(aes(y = neighbourhood_group,
+               fill = neighbourhood_group,
+               x = price + 1)) +
+    geom_density_ridges(show.legend = F) +
+    scale_x_log10(labels = scales::dollar_format()) +
+    scale_fill_manual(values = wes_palette("Darjeeling1")) +
+    coord_cartesian(xlim = c(10, 1500)) +
+    labs(x = "Price per night (log scale)",
+         y = NULL)
+
+
+```
+
+```{r}
+library(ggthemes)
+
+df %>% 
+    sample_n(10000) %>% 
+    ggplot(aes(longitude, latitude, colour = log(price + 1))) +
+    geom_point(size = .1) +
+    scale_color_viridis_b() +
+    theme_map()
+
+```
+
+
+```{r}
+df %>% head() %>% view()
+
+df %>% 
+    count(room_type, sort = T)
+
+df %>% 
+    mutate(room_type = fct_reorder(room_type, log(price + 1), .fun = median)) %>% 
+    ggplot(aes(y = room_type,
+               fill = room_type,
+               x = price + 1)) +
+    geom_density_ridges(show.legend = F) +
+    scale_x_log10(labels = scales::dollar_format()) +
+    scale_fill_manual(values = wes_palette("Darjeeling1")) +
+    coord_cartesian(xlim = c(10, 1500)) +
+    labs(x = "Price per night (log scale)",
+         y = NULL)
+```
+
+```{r}
+train %>% 
+    ggplot(aes(number_of_reviews)) +
+    geom_histogram() +
+    scale_x_log10()
+
+train %>% 
+    ggplot(aes(price, number_of_reviews)) +
+    geom_point() +
+    geom_smooth() +
+    scale_x_log10() +
+    scale_y_log10()
+
+train %>% 
+    count(calculated_host_listings_count, sort = T)
+
+train %>% 
+    ggplot(aes(calculated_host_listings_count)) +
+    geom_histogram() +
+    scale_x_log10()
+```
+
+
+
+### Modelling prep
+
+```{r}
+library(tidymodels)
+
+set.seed(2021)
+df <- df %>% 
+    mutate(price = log(price + 1))
+
+spl <- initial_split(df, strata = price)
+train <- training(spl)
+test <- testing(spl)
+
+folds <- vfold_cv(train, v = 5)
+
+mset <- metric_set(rmse, rsq)
+grid_control <- control_grid(save_pred = T,
+                             save_workflow = T,
+                             extract = extract_model)
+```
+
+```{r}
+library(doParallel)
+
+cl <- makePSOCKcluster(8)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {library(tidymodels)})
+```
+
+
+Try with simple logistic regression just to see what sticks
+
+```{r}
+library(textrecipes)
+
+glmnet_rec <- recipe(price ~ ., data = train) %>% 
+    update_role(id, host_id, host_name, new_role = "id") %>% 
+    step_ns(latitude, longitude, deg_free = tune()) %>% 
+    step_log(number_of_reviews, offset = 1) %>% 
+    step_impute_mean(reviews_per_month) %>% 
+    step_mutate(minimum_nights = case_when(
+        minimum_nights == 1 ~ "one",
+        between(minimum_nights, 2, 7) ~ "two to seven",
+        TRUE ~ "more than seven"
+    )) %>% 
+    step_mutate(minimum_nights = factor(minimum_nights)) %>% 
+    # cuts calculated_host_listings_count after 20 down to 20
+    step_mutate(calculated_host_listings_count = pmin(calculated_host_listings_count, 30)) %>% 
+    step_other(neighbourhood, threshold = tune()) %>% 
+    step_tokenize(name) %>% 
+    step_tokenfilter(name, max_tokens = tune()) %>% 
+    step_tf(name) %>% 
+    step_rm(availability_365, last_review) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_normalize(all_predictors())
+
+# juiced <- glmnet_rec %>% prep() %>% juice()
+
+# juiced %>% view()
+```
+
+```{r}
+glmnet_spec <- 
+  linear_reg(penalty = tune(), mixture = 1) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet") 
+
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(glmnet_rec) %>% 
+  add_model(glmnet_spec) 
+
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20), 
+                               max_tokens = c(50, 100),
+                               deg_free = 7,
+                               threshold = .01) 
+
+# glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20))
+
+
+glmnet_tune <- 
+  tune_grid(glmnet_workflow, 
+            resamples = folds,
+            control = grid_control,
+            grid = glmnet_grid)
+```
+
+
+penalty deg_free threshold max_tokens               
+0.000234        7      0.01        100 
+
+```{r}
+glmnet_tune %>% autoplot()
+
+glm_fit <- glmnet_workflow %>% finalize_workflow(select_best(glmnet_tune)) %>% 
+  fit(train)
+
+glm_fit %>% extract_model() %>% tidy() %>% 
+  filter(term != "(Intercept)") %>% 
+  group_by(term) %>% 
+  filter(estimate == max(estimate)) %>% 
+  ungroup() %>% 
+  slice_max(abs(estimate), n = 50) %>% 
+  mutate(term = fct_reorder(term, estimate)) %>% 
+  ggplot(aes(estimate, term)) +
+  geom_col()
+```
+
+
+### XG boost
+
+```{r}
+xgboost_recipe <- recipe(price ~ ., data = train) %>% 
+    update_role(id, host_id, host_name, new_role = "id") %>% 
+    step_log(number_of_reviews, availability_365,offset = 1) %>% 
+    step_impute_mean(reviews_per_month) %>% 
+    step_mutate(minimum_nights = case_when(
+        minimum_nights == 1 ~ "one",
+        between(minimum_nights, 2, 7) ~ "two to seven",
+        TRUE ~ "more than seven"
+    )) %>% 
+    step_mutate(minimum_nights = factor(minimum_nights)) %>% 
+    # cuts calculated_host_listings_count after 20 down to 20
+    step_mutate(calculated_host_listings_count = pmin(calculated_host_listings_count, 30)) %>% 
+    step_rm(last_review, name, neighbourhood) %>% 
+    step_dummy(all_nominal_predictors()) 
+
+xgboost_spec <- 
+  boost_tree(trees = tune(), 
+             mtry = tune(), 
+             learn_rate = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("xgboost") 
+
+xgboost_workflow <- 
+  workflow() %>% 
+  add_recipe(xgboost_recipe) %>% 
+  add_model(xgboost_spec) 
+
+xgboost_grid <- crossing(trees = c(2000, 3000),
+                         mtry = c(3, 5, 7, 9),
+                         learn_rate = c(.001, .015, .02, .025))
+
+set.seed(41321)
+xgboost_tune <-
+  tune_grid(xgboost_workflow, 
+            resamples = folds, 
+            control = grid_control,
+            grid = xgboost_grid)
+```
+
+
+```{r}
+xgboost_tune %>% autoplot()
+
+xg_final_params <- xgboost_tune %>% select_best("rsq")
+
+xg_wf_final <- xgboost_workflow %>% 
+  finalize_workflow(xg_final_params)
+
+xg_final_fit <- xg_wf_final %>% 
+  fit(train)
+
+xg_final_wf_fit <- xg_final_fit %>% pull_workflow_fit()
+
+model_fit <- xgboost::xgb.importance(model = extract_model(xg_final_fit))
+
+model_fit %>% as_tibble() %>% 
+  mutate(Feature = fct_reorder(Feature, Gain)) %>% 
+  ggplot(aes(Gain, Feature, fill = Feature)) +
+  geom_col(show.legend = F)
+```
+
+### Model stack
+
+```{r}
+library(stacks)
+
+airbnb_stack <- 
+  stacks() %>%
+  add_candidates(glmnet_tune) %>% 
+  add_candidates(xgboost_tune)
+  
+airbnb_stack_blended <- airbnb_stack %>% 
+  blend_predictions()
+```
+
+What do the metrics look like?
+
+```{r}
+autoplot(airbnb_stack_blended)
+
+autoplot(airbnb_stack_blended, type = "weights")
+
+```
+
+```{r}
+# write_rds(airbnb_stack_blended, "blended_stack.rds", compress = "gz")
+airbnb_stack_blended <- read_rds("blended_stack.rds")
+
+airbnb_stack_fitted <- airbnb_stack_blended %>% 
+  fit_members()
+
+
+```
+
+
+Then we can do prediction
+
+```{r}
+
+airbnb_test_preds <- 
+  test %>%
+  bind_cols(predict(airbnb_stack_fitted, .))
+
+airbnb_test_preds %>% 
+  rsq(price, .pred)
+
+airbnb_test_preds %>% 
+  mutate(across(.cols = c(price, .pred), .fns = ~ exp(.) + 1)) %>% 
+  ggplot(aes(price, .pred)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+```
+
